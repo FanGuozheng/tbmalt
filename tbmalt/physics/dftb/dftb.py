@@ -1,8 +1,7 @@
 """DFTB calculator.
-
 implement pytorch to DFTB
 """
-from typing import Literal, Dict, List, Optional
+from typing import Literal, Dict, List, Union
 import torch
 from torch import Tensor
 import tbmalt.common.maths as maths
@@ -17,6 +16,8 @@ from tbmalt.ml.skfeeds import VcrFeed, TvcrFeed
 from tbmalt.physics.electrons import Gamma
 from tbmalt.structures.periodic import Periodic
 from tbmalt.physics.coulomb import Coulomb
+from tbmalt.data.units import energy_units
+from tbmalt.physics.filling import fermi_search, fermi_smearing
 
 
 class Dftb:
@@ -29,12 +30,16 @@ class Dftb:
                  basis_type: str = 'normal',
                  periodic: Periodic = None,
                  mixer: str = 'Anderson',
+                 temperature = 300.0,
                  **kwargs):
         self.skf_type = skf_type
         self.shell_dict = shell_dict
         self.geometry = geometry
         self.repulsive = repulsive
         self.mixer_type = mixer
+        self.temperature = temperature
+        self.merge_onsite_orbs = kwargs.get('merge_onsite_orbs', True)
+        self.onsite_orbital_resolved = kwargs.get('onsite_orbital_resolved', False)
 
         self.interpolation = kwargs.get('interpolation', 'PolyInterpU')
         self.batch = True if self.geometry.distances.dim() == 3 else False
@@ -46,29 +51,45 @@ class Dftb:
         self.basis = Basis(self.geometry.atomic_numbers, self.shell_dict)
         self.h_feed = hsfeed.from_dir(
             path_to_skf, shell_dict, vcr=_grids, skf_type=skf_type,
-            geometry=geometry, interpolation=_interp, integral_type='H')
+            geometry=geometry, interpolation=_interp, integral_type='H',
+            merge_orbs=self.merge_onsite_orbs,
+            onsite_orbital_resolved=self.onsite_orbital_resolved)
         self.s_feed = hsfeed.from_dir(
             path_to_skf, shell_dict, vcr=_grids, skf_type=skf_type,
-            geometry=geometry, interpolation=_interp, integral_type='S')
+            geometry=geometry, interpolation=_interp, integral_type='S',
+            merge_orbs=self.merge_onsite_orbs,
+            onsite_orbital_resolved=self.onsite_orbital_resolved)
         self.skparams = SkfParamFeed.from_dir(
-            path_to_skf, geometry, skf_type=skf_type)
+            path_to_skf, geometry, skf_type=skf_type, repulsive=repulsive)
 
     def init_dftb(self, **kwargs):
         self._n_batch = self.geometry._n_batch if self.geometry._n_batch \
             is not None else 1
         self.dtype = self.geometry.positions.dtype if \
-            not self.geometry.isperiodic else torch.complex128
+            not self.geometry.is_periodic else torch.complex128
         self.qzero = self.skparams.qzero
 
         self.nelectron = self.qzero.sum(-1)
 
-        if self.geometry.isperiodic:
+        if self.geometry.is_periodic:
             self.periodic = Periodic(self.geometry, self.geometry.cell,
                                      cutoff=self.skparams.cutoff, **kwargs)
             self.coulomb = Coulomb(self.geometry, self.periodic, method='search')
             self.distances = self.periodic.periodic_distances
             self.u = self._expand_u(self.skparams.U)
             self.max_nk = torch.max(self.periodic.n_kpoints)
+
+            # self.ksampling = Ksampling(
+            #     self.geometry._n_batch, self.geometry.atomic_numbers, **kwargs
+            # )
+            # self.kpoints = self.ksampling.kpoints
+            self.kpoints = self.periodic.kpoints
+            self.n_kpoints = self.periodic.n_kpoints
+            self.k_weights = self.periodic.k_weights
+            self.phase = self.periodic.phase
+            self.max_nk = torch.max(self.periodic.n_kpoints)
+
+
         else:
             self.distances = self.geometry.distances
             self.u = self.skparams.U  # self.skt.U
@@ -123,18 +144,20 @@ class Dftb:
         """Hamiltonian or overlap feed."""
         multi_varible = kwargs.get('multi_varible', None)
 
-        if self.geometry.isperiodic:
+        if self.geometry.is_periodic:
             hs_obj = self.periodic
         else:
             hs_obj = self.geometry
         if hamiltonian is None:
             self.ham = hs_matrix(
-                hs_obj, self.basis, self.h_feed, multi_varible=multi_varible)
+                hs_obj, self.basis, self.h_feed, multi_varible=multi_varible,
+                cutoff=self.skparams.cutoff+1.0)
         else:
             self.ham = hamiltonian
         if overlap is None:
             self.over = hs_matrix(
-                hs_obj, self.basis, self.s_feed, multi_varible=multi_varible)
+                hs_obj, self.basis, self.s_feed, multi_varible=multi_varible,
+                cutoff=self.skparams.cutoff+1.0)
         else:
             self.over = overlap
 
@@ -145,7 +168,7 @@ class Dftb:
 
         self.geometry = geometry
 
-        if self.geometry.isperiodic:
+        if self.geometry.is_periodic:
             self.periodic = Periodic(self.geometry, self.geometry.cell,
                                      cutoff=self.skparams.cutoff, **kwargs)
             self.coulomb = Coulomb(self.geometry, self.periodic, method='search')
@@ -161,7 +184,7 @@ class Dftb:
 
     def _get_shift(self):
         """Return shift term for periodic and non-periodic."""
-        if not self.geometry.isperiodic:
+        if not self.geometry.is_periodic:
             return self.inv_dist - self.short_gamma
         else:
             return self.coulomb.invrmat - self.short_gamma
@@ -309,6 +332,20 @@ class Dftb:
     def U(self):
         return self.skparams.U
 
+    def _kt(self) -> Union[Tensor, float]:
+        return self.temperature * energy_units["k"] / energy_units['ev']
+
+    @property
+    def E_fermi(self):
+        basis = self.basis  # if self.basis_virtual is None else self.basis_virtual
+        return fermi_search(
+            eigenvalues=self._epsilon.transpose(0, 1) / energy_units['ev'],
+            n_electrons=self.nelectron,
+            e_mask=basis,
+            kT=self._kt(),
+            k_weights=self.k_weights,
+        )
+
 
 class Dftb1(Dftb):
     """Density-functional tight-binding method with 0th correction."""
@@ -316,13 +353,15 @@ class Dftb1(Dftb):
     def __init__(self,
                  geometry: Geometry,
                  shell_dict: dict = None,
+                 path_to_skf: str = './',
                  basis: object = None,
                  repulsive=True,
                  skf_type: str = 'h5', **kwargs):
         self.method = 'Dftb1'
         self.maxiter = kwargs.get('maxiter', 1)
         super().__init__(
-            geometry, shell_dict, basis, repulsive, skf_type, **kwargs)
+            geometry, shell_dict, path_to_skf, repulsive, skf_type, **kwargs)
+            # geometry, shell_dict, path_to_skf, basis, repulsive, skf_type, **kwargs)
         super().init_dftb(**kwargs)
 
     def __call__(self,
@@ -330,12 +369,13 @@ class Dftb1(Dftb):
                  geometry: Geometry = None,  # Update Geometry
                  hamiltonian: Tensor = None,
                  overlap: Tensor = None,
+                 mask: Tensor = None,
                  **kwargs):
         if geometry is not None:
             super()._next_geometry(geometry, **kwargs)
         self.shift = self._get_shift()
 
-        self.mask = torch.tensor([True]).repeat(self._n_batch)
+        self.mask = torch.tensor([True]).repeat(self._n_batch) if mask is None else mask
         super().__hs__(hamiltonian, overlap, **kwargs)
 
         # self.gamma = self.inv_dist - self.short_gamma
@@ -348,11 +388,47 @@ class Dftb1(Dftb):
                 zip(self.atom_orbitals, self._shift)])
             self._shift_mat = torch.stack([torch.unsqueeze(ishift, 1) + ishift
                                            for ishift in self.shift_orb])
+            if self.geometry.is_periodic:
+                self._shift_mat = self._shift_mat.repeat(torch.max(
+                    self.periodic.n_kpoints), 1, 1, 1).permute(1, 2, 3, 0)
 
             self.hamiltonian = self.ham + 0.5 * self.over * self._shift_mat
-            self.qm = super().__call__(self.hamiltonian, self.over, iiter=0)
+            # self.qm = super().__call__(self.hamiltonian, self.over, iiter=0)
+            ham = self.hamiltonian
+            over = self.over
         else:
-            self.qm = super().__call__(self.ham, self.over, iiter=0)
+            # self.qm = super().__call__(self.ham, self.over, iiter=0)
+            ham = self.ham
+            over = self.over
+
+        if self.geometry.is_periodic:
+            epsilon, eigvec, rho, density, q_new = [], [], [], [], []
+            for ik in range(self.max_nk):
+
+                # calculate the eigen-values & vectors
+                iep, ieig = maths.eighb(ham[..., ik], over[..., ik])
+                epsilon.append(iep), eigvec.append(ieig)
+
+                iocc, inocc = fermi(iep, self.nelectron)
+                # nocc.append(inocc)
+                iden = torch.sqrt(iocc).unsqueeze(1).expand_as(ieig) * ieig
+                irho = (torch.conj(iden) @ iden.transpose(1, 2))  # -> density
+                density.append(irho)
+
+                # calculate mulliken charges for each system in batch
+                iq = mulliken(self.over[..., ik], irho, self.atom_orbitals)
+
+                _q = iq.real
+                q_new.append(_q)
+
+            # nocc = pack(nocc).T
+            self.rho = pack(density).permute(1, 2, 3, 0)
+            self.qm = (pack(q_new).permute(2, 1, 0) * self.periodic.k_weights).sum(-1).T
+
+            self._epsilon = pack(epsilon).permute(1, 0, 2)
+
+        else:
+            self.qm = super().__call__(ham, over, iiter=0)
 
         self._charge = self.qm
 
@@ -382,6 +458,7 @@ class Dftb2(Dftb):
                  geometry: Geometry = None,  # Update Geometry
                  hamiltonian: Tensor = None,
                  overlap: Tensor = None,
+                 mask: bool = None,
                  **kwargs):
         """Perform SCC-DFTB calculation."""
         self.mixer = globals()[self.mixer_type](self.qzero, return_convergence=True)
@@ -390,7 +467,7 @@ class Dftb2(Dftb):
         if geometry is not None:
             super()._next_geometry(geometry)
 
-        self.mask = torch.tensor([True]).repeat(self._n_batch)
+        self.mask = torch.tensor([True]).repeat(self._n_batch) if mask is None else mask
         super().__hs__(hamiltonian, overlap, **kwargs)
         self._charge = self.qzero.clone() if charge is None else charge
 
@@ -409,7 +486,7 @@ class Dftb2(Dftb):
                           zip(self.atom_orbitals[self.mask], shift_)])
         shift_mat = torch.stack([torch.unsqueeze(ishift, 1) + ishift
                                  for ishift in shiftorb_])
-        if self.geometry.isperiodic:
+        if self.geometry.is_periodic:
             shift_mat = shift_mat.repeat(torch.max(
                 self.periodic.n_kpoints), 1, 1, 1).permute(1, 2, 3, 0)
 
@@ -419,7 +496,7 @@ class Dftb2(Dftb):
         fock = self.ham[self.mask, :this_size, :this_size] + \
             0.5 * self.over[self.mask, :this_size, :this_size] * shift_mat
 
-        if not self.geometry.isperiodic:
+        if not self.geometry.is_periodic:
             d_q = self._charge[self.mask] - self.qzero[self.mask]
             self._shift = torch.bmm(d_q.unsqueeze(1), self.shift[self.mask])
 
@@ -437,7 +514,9 @@ class Dftb2(Dftb):
 
             # single loop SCC-DFTB calculation
             self.qm = super().__call__(self.hamiltonian, overlap, iiter)
+
             self.qmix, _mask = self.mixer(self.qm)
+
             self._charge[self.mask] = self.qmix
             self._density[self.mask, :self.rho.shape[1], :self.rho.shape[2]] = self.rho
             self._occ[self.mask, :self.occ.shape[-1]] = self.occ
@@ -537,22 +616,27 @@ class Dftb2(Dftb):
     def pdos(self):
         """Return PDOS."""
         energy = torch.linspace(-1, 1, 200)
-        return pdos(self.eigenvector, self.over, self._epsilon, energy)
+        if self.geometry.is_periodic:
+            return pdos(self.eigenvector.permute(-1, 0, 1, 2),
+                        self.over.permute(-1, 0, 1, 2), self._epsilon, energy,
+                        is_periodic=self.geometry.is_periodic)
+        else:
+            return pdos(self.eigenvector, self.over, self._epsilon, energy)
+
 
     @property
     def dos(self):
         """Return energy distribution and DOS with fermi energy correction."""
-        sigma = self.params.dftb_params['sigma']
         energy = self.dos_energy
-        energy = energy.repeat(self.system.size_batch, 1)  # -> to batch
+        # energy = energy.repeat(self.system.size_batch, 1)  # -> to batch
 
         # make sure the 1st dimension is batch
         if self.unit in ('eV', 'EV', 'ev'):
-            return dos((self._epsilon - self.fermi.unsqueeze(1)),
-                       energy, sigma)  #, mask=self.band_filter)
+            return dos((self._epsilon - self.E_fermi.unsqueeze(1)),
+                       energy, self.geometry.is_periodic)  #, mask=self.band_filter)
         elif self.unit in ('hartree', 'Hartree'):
-            return dos(self._epsilon - self.fermi.unsqueeze(1) * _Hartree__eV,
-                       energy, sigma)  #, mask=self.band_filter)
+            return dos(self._epsilon - self.E_fermi.unsqueeze(1) * _Hartree__eV,
+                       energy, self.geometry.is_periodic)  #, mask=self.band_filter)
 
     @property
     def band_filter(self, n_homo=torch.tensor([3]), n_lumo=torch.tensor([3]),
@@ -572,3 +656,42 @@ class Dftb3(Dftb):
 
     def __init__(self):
         pass
+
+if __name__ == '__main__':
+    from ase.build import molecule
+    device = torch.device('cpu')
+    torch.set_default_dtype(torch.float64)
+    torch.set_printoptions(15)
+
+    shell_dict = {1: [0], 6: [0, 1], 8: [0, 1]}
+
+    geometry = Geometry.from_ase_atoms([molecule('CH3O')])
+    # geometry = Geometry.from_ase_atoms(
+    #     [molecule('CH3O'), molecule('OCHCHO'), molecule('CH3CHO'),
+    #      molecule('CH3CH2OCH3'), molecule('bicyclobutane')])
+    path_to_skf = "../../../tests/unittests/data/slko/auorg-1-1"
+
+    dftb2 = Dftb2(
+        geometry=geometry,
+        shell_dict=shell_dict,
+        path_to_skf=path_to_skf,
+        skf_type="skf",
+        temperature=0.0,
+    )
+    dftb2(mix_tolerance=1E-10)
+    print(dftb2.charge)
+
+
+    # geometry = Geometry.from_ase_atoms(
+    #     [molecule('CH3O'), molecule('OCHCHO'), molecule('CH3CHO'),
+    #      molecule('CH3CH2OCH3'), molecule('bicyclobutane')])
+    # path_to_skf = "../../../tests/unittests/data/slko/auorg-1-1"
+    #
+    # dftb2 = Dftb2(
+    #     geometry=geometry,
+    #     shell_dict=shell_dict,
+    #     path_to_skf=path_to_skf,
+    #     skf_type="skf",
+    #     temperature=0.0,
+    # )
+    # dftb2(mix_tolerance=1E-10)

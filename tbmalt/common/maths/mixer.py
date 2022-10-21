@@ -284,3 +284,42 @@ class Anderson(_Mixer):
     def __convergence__(self):
         """Return convergence."""
         return super().__convergence__()
+
+
+class Broyden(_Mixer):
+
+    def __init__(self, q_init: Tensor, mix_param=0.2, generations=3, **kwargs):
+        super().__init__(q_init, mix_param, **kwargs)
+        self.generations = generations
+        self.gamma = kwargs.get('gamma', 0.01)
+        self._build_matrices(self.q_init)
+        self._dQ[0] = self.q_init
+
+    def __call__(self, q_new: Tensor, q_old=None, **kwargs):
+        """Perform the actual Broyden mixing operation.
+
+        Arguments:
+            q_new: The newly calculated, pure, dQ vector that is to be mixed.
+            q_old: The previous, mixed charges. If q_old is available,
+                assign q_old to dQs[0].
+
+        """
+        super().__call__(q_new, **kwargs)
+        self._step_number += 1  # increment _step_number
+
+        self._F[0, self.mask, :self.this_size] = \
+            self.qnew - self._dQ[0, self.mask, :self.this_size]
+
+        if self._step_number >= 2:
+            previous_step = self._step_number if self._step_number < \
+                self.generations + 1 else self.generations + 1
+
+
+
+class DIIS(_Mixer):
+
+    def __init__(self):
+        pass
+
+    def __call__(self, *args, **kwargs):
+        pass
