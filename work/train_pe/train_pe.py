@@ -549,4 +549,13 @@ def _plot(reference: Tensor, data1: Tensor, data2: Tensor, target: str,
         plt.savefig(target, dpi=300)
     plt.show()
 
+if __name__ == '__main__':
+    dataset = 'band_c_si.h5'
+    batch_size = 3
+    train_onsite = 'local'
+    orbital_resolved = False
+    scale_ham = True
+    param = {'ml': {'lr': 1e-3, 'onsite_lr': 1e-3}}
+    train_function(dataset, ['c_bulk_diamond2'], [0.4], batch_size, train_onsite,
+                                  orbital_resolved, scale_ham,  _params=param)
 
